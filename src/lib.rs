@@ -50,7 +50,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::prelude::*;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -275,52 +275,10 @@ impl Config {
         self
     }
 
-    /// Run this configuration, compiling the library with all the configured
-    /// options.
-    ///
-    /// This will run both the build system generator command as well as the
-    /// command to build the library.
-    pub fn build(&mut self) -> PathBuf {
-        let target = match self.target.clone() {
-            Some(t) => t,
-            None => {
-                let mut t = getenv_unwrap("TARGET");
-                if t.ends_with("-darwin") && self.uses_cxx11 {
-                    t = t + "11"
-                }
-                t
-            }
-        };
-        let host = self.host.clone().unwrap_or_else(|| getenv_unwrap("HOST"));
+    fn make_config_cmd(&self, profile: &str, build_type: &str, build_type_upcase: &str,
+                       c_compiler: &str, cxx_compiler: &str,
+                       target: &str, host: &str, dst: &Path) -> Command {
         let msvc = target.contains("msvc");
-        let mut c_cfg = cc::Build::new();
-        c_cfg
-            .cargo_metadata(false)
-            .opt_level(0)
-            .debug(false)
-            .target(&target)
-            .warnings(false)
-            .host(&host);
-        let mut cxx_cfg = cc::Build::new();
-        cxx_cfg
-            .cargo_metadata(false)
-            .cpp(true)
-            .opt_level(0)
-            .debug(false)
-            .target(&target)
-            .warnings(false)
-            .host(&host);
-        if let Some(static_crt) = self.static_crt {
-            c_cfg.static_crt(static_crt);
-            cxx_cfg.static_crt(static_crt);
-        }
-        let c_compiler = c_cfg.get_compiler();
-        let cxx_compiler = cxx_cfg.get_compiler();
-
-        let dst = self
-            .out_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(getenv_unwrap("OUT_DIR")));
         let build = dst.join("build");
         self.maybe_clear(&build);
         let _ = fs::create_dir(&build);
@@ -448,68 +406,7 @@ impl Config {
         if let Some(ref generator) = self.generator {
             cmd.arg("-G").arg(generator);
         }
-        let profile = self.profile.clone().unwrap_or_else(|| {
-            // Automatically set the `CMAKE_BUILD_TYPE` if the user did not
-            // specify one.
 
-            // Determine Rust's profile, optimization level, and debug info:
-            #[derive(PartialEq)]
-            enum RustProfile {
-                Debug,
-                Release,
-            }
-            #[derive(PartialEq, Debug)]
-            enum OptLevel {
-                Debug,
-                Release,
-                Size,
-            }
-
-            let rust_profile = match &getenv_unwrap("PROFILE")[..] {
-                "debug" => RustProfile::Debug,
-                "release" | "bench" => RustProfile::Release,
-                unknown => {
-                    eprintln!(
-                        "Warning: unknown Rust profile={}; defaulting to a release build.",
-                        unknown
-                    );
-                    RustProfile::Release
-                }
-            };
-
-            let opt_level = match &getenv_unwrap("OPT_LEVEL")[..] {
-                "0" => OptLevel::Debug,
-                "1" | "2" | "3" => OptLevel::Release,
-                "s" | "z" => OptLevel::Size,
-                unknown => {
-                    let default_opt_level = match rust_profile {
-                        RustProfile::Debug => OptLevel::Debug,
-                        RustProfile::Release => OptLevel::Release,
-                    };
-                    eprintln!(
-                        "Warning: unknown opt-level={}; defaulting to a {:?} build.",
-                        unknown, default_opt_level
-                    );
-                    default_opt_level
-                }
-            };
-
-            let debug_info: bool = match &getenv_unwrap("DEBUG")[..] {
-                "false" => false,
-                "true" => true,
-                unknown => {
-                    eprintln!("Warning: unknown debug={}; defaulting to `true`.", unknown);
-                    true
-                }
-            };
-
-            match (opt_level, debug_info) {
-                (OptLevel::Debug, _) => "Debug",
-                (OptLevel::Release, false) => "Release",
-                (OptLevel::Release, true) => "RelWithDebInfo",
-                (OptLevel::Size, _) => "MinSizeRel",
-            }.to_string()
-        });
         for &(ref k, ref v) in &self.defines {
             let mut os = OsString::from("-D");
             os.push(k);
@@ -523,17 +420,6 @@ impl Config {
             dstflag.push(&dst);
             cmd.arg(dstflag);
         }
-
-        let build_type = self
-            .defines
-            .iter()
-            .find(|&&(ref a, _)| a == "CMAKE_BUILD_TYPE")
-            .map(|x| x.1.to_str().unwrap())
-            .unwrap_or(&profile);
-        let build_type_upcase = build_type
-            .chars()
-            .flat_map(|c| c.to_uppercase())
-            .collect::<String>();
 
         {
             // let cmake deal with optimization/debuginfo
@@ -644,12 +530,203 @@ impl Config {
             cmd.env(k, v);
         }
 
+        cmd.env("CMAKE_PREFIX_PATH", cmake_prefix_path);
+
+        cmd
+    }
+
+    /// Run this configuration, compiling the library with all the configured
+    /// options.
+    ///
+    /// This will run both the build system generator command as well as the
+    /// command to build the library.
+    pub fn build(&mut self) -> PathBuf {
+        let target = match self.target.clone() {
+            Some(t) => t,
+            None => {
+                let mut t = getenv_unwrap("TARGET");
+                if t.ends_with("-darwin") && self.uses_cxx11 {
+                    t = t + "11"
+                }
+                t
+            }
+        };
+        let dst = self
+            .out_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(getenv_unwrap("OUT_DIR")));
+
+        let host = self.host.clone().unwrap_or_else(|| getenv_unwrap("HOST"));
+
+        let mut c_cfg = cc::Build::new();
+        c_cfg
+            .cargo_metadata(false)
+            .opt_level(0)
+            .debug(false)
+            .target(&target)
+            .warnings(false)
+            .host(&host);
+        let mut cxx_cfg = cc::Build::new();
+        cxx_cfg
+            .cargo_metadata(false)
+            .cpp(true)
+            .opt_level(0)
+            .debug(false)
+            .target(&target)
+            .warnings(false)
+            .host(&host);
+        if let Some(static_crt) = self.static_crt {
+            c_cfg.static_crt(static_crt);
+            cxx_cfg.static_crt(static_crt);
+        }
+        let c_compiler = c_cfg.get_compiler();
+        let cxx_compiler = cxx_cfg.get_compiler();
+
+        let executable = env::var("CMAKE").unwrap_or("cmake".to_owned());
+
+        let mut maybe_explicit_debug = None;
+        let profile = self.profile.clone().unwrap_or_else(|| {
+            // Automatically set the `CMAKE_BUILD_TYPE` if the user did not
+            // specify one.
+
+            // Determine Rust's profile, optimization level, and debug info:
+            #[derive(PartialEq)]
+            enum RustProfile {
+                Debug,
+                Release,
+            }
+            #[derive(PartialEq, Debug)]
+            enum OptLevel {
+                Debug,
+                Release,
+                Size,
+            }
+
+            let rust_profile = match &getenv_unwrap("PROFILE")[..] {
+                "debug" => RustProfile::Debug,
+                "release" | "bench" => RustProfile::Release,
+                unknown => {
+                    eprintln!(
+                        "Warning: unknown Rust profile={}; defaulting to a release build.",
+                        unknown
+                    );
+                    RustProfile::Release
+                }
+            };
+
+            let opt_level = match &getenv_unwrap("OPT_LEVEL")[..] {
+                "0" => OptLevel::Debug,
+                "1" | "2" | "3" => OptLevel::Release,
+                "s" | "z" => OptLevel::Size,
+                unknown => {
+                    let default_opt_level = match rust_profile {
+                        RustProfile::Debug => OptLevel::Debug,
+                        RustProfile::Release => OptLevel::Release,
+                    };
+                    eprintln!(
+                        "Warning: unknown opt-level={}; defaulting to a {:?} build.",
+                        unknown, default_opt_level
+                    );
+                    default_opt_level
+                }
+            };
+
+            let debug_info: bool = match &getenv_unwrap("DEBUG")[..] {
+                "false" => false,
+                "true" => true,
+                unknown => {
+                    eprintln!("Warning: unknown debug={}; defaulting to `true`.", unknown);
+                    true
+                }
+            };
+
+            let (profile, debug) = match (opt_level, debug_info) {
+                (OptLevel::Debug, false) => ("Debug", Some(false)),
+                (OptLevel::Debug, true) => ("Debug", None),
+                (OptLevel::Release, false) => ("Release", None),
+                (OptLevel::Release, true) => ("RelWithDebInfo", None),
+                (OptLevel::Size, false) => ("MinSizeRel", None),
+                (OptLevel::Size, true) => ("MinSizeRel", Some(true)),
+            };
+
+            // If this is Some itmeans that cargo wants to set debuginfo
+            // contrary to cmake's profile. It means we're going to have to do
+            // some ugly work to make it happen.
+            maybe_explicit_debug = debug;
+
+            profile.to_string()
+        });
+
+        let build_type = self
+            .defines
+            .iter()
+            .find(|&&(ref a, _)| a == "CMAKE_BUILD_TYPE")
+            .map(|x| x.1.to_str().unwrap())
+            .unwrap_or(&profile);
+        let build_type_upcase = build_type
+            .chars()
+            .flat_map(|c| c.to_uppercase())
+            .collect::<String>();
+
+        // We have to change the debug setting to be the opposite of what the CMake profile
+        // defaults to. The way we are going to do this is call cmake with `-LA` to get it
+        // to print CMAKE_C_FLAGS_DEBUG, etc, then modify that to add or remove `-g` etc,
+        // then set it explicitly so cmake accepts our value.
+        //
+        // TODO: How to make this work on windows
+        let mut new_flags = vec![];
+
+        println!("xxx {} {:?}", profile, maybe_explicit_debug);
+        if let Some(debug) = maybe_explicit_debug {
+            let profile_c_flags = format!("CMAKE_C_FLAGS_{}", build_type_upcase);
+            let profile_cxx_flags = format!("CMAKE_CXX_FLAGS_{}", build_type_upcase);
+
+            println!("capturing CMake variables. this may take a second");
+            let mut cmd = self.make_config_cmd(&profile, &build_type, &build_type_upcase, &executable, &target, &host, &dst);
+            cmd.arg("-LA");
+            let out = run_output(cmd, "cmake");
+            for line in out.lines() {
+                for var in &[&profile_c_flags, &profile_cxx_flags] {
+                    if line.starts_with(var.as_str()) {
+                        let prefix=format!("{}:STRING=", var);
+                        let mut value = line[prefix.len()..].to_string();
+                        if debug {
+                            // Add -g
+                            value = format!("{} -g", value);
+                        } else {
+                            // Remove -g
+                            value = value.replace(" -g ", " ");
+                            if value.starts_with("-g ") {
+                                value = value["-g ".len()..].to_string();
+                            }
+                            if value.ends_with(" -g") {
+                                value = value[..value.len() - " -g".len()].to_string();
+                            }
+                            if value == "-g" {
+                                value = String::new();
+                            }
+                        }
+                        println!("old value: {}", line);
+                        println!("new value: {}:STRING={}", var, value);
+                        new_flags.push((var.to_string(), value));
+                    }
+                }
+            }
+        }
+
+        let mut cmd = self.make_config_cmd(&profile, &build_type, &build_type_upcase, &executable, &target, &host, &dst);
+
+        for (var, val) in new_flags {
+            let flag = format!("{}={}", var, val);
+            cmd.arg(flag);
+        }
+
         if self.always_configure || !build.join("CMakeCache.txt").exists() {
-            run(cmd.env("CMAKE_PREFIX_PATH", cmake_prefix_path), "cmake");
+            run(&mut cmd, "cmake");
         } else {
             println!("CMake project was already configured. Skipping configuration step.");
         }
-
+        
         let mut makeflags = None;
         let mut parallel_flags = None;
 
@@ -689,14 +766,14 @@ impl Config {
             }
         }
 
-        // And build!
+        // Set up the cmake command
         let target = self.cmake_target.clone().unwrap_or("install".to_string());
         let mut cmd = Command::new(&executable);
         for &(ref k, ref v) in c_compiler.env().iter().chain(&self.env) {
             cmd.env(k, v);
         }
 
-        if let Some(flags) = makeflags {
+        if let Some(flags) = makeflags.as_ref() {
             cmd.env("MAKEFLAGS", flags);
         }
 
@@ -712,10 +789,14 @@ impl Config {
             .args(&self.build_args)
             .current_dir(&build);
 
-        if let Some(flags) = parallel_flags {
+        if let Some(flags) = parallel_flags.as_ref() {
             cmd.arg(flags);
         }
 
+        // And build!
+        for (var, val) in new_flags {
+            cmd.arg(format!("-D{}={}", var, val));
+        }
         run(&mut cmd, "cmake");
 
         println!("cargo:root={}", dst.display());
@@ -795,23 +876,52 @@ impl Config {
 }
 
 fn run(cmd: &mut Command, program: &str) {
+    run_common(cmd, program, false);
+}
+
+fn run_output(cmd: &mut Command, program: &str) -> String {
+    run_common(cmd, program, true).unwrap()
+}
+
+fn run_common(cmd: &mut Command, program: &str, capture: bool) -> Option<String> {
     println!("running: {:?}", cmd);
-    let status = match cmd.status() {
-        Ok(status) => status,
-        Err(ref e) if e.kind() == ErrorKind::NotFound => {
+
+    let error = |e: io::Error| -> ! {
+        if e.kind() == ErrorKind::NotFound {
             fail(&format!(
                 "failed to execute command: {}\nis `{}` not installed?",
                 e, program
-            ));
+            ))
+        } else {
+            fail(&format!("failed to execute command: {}", e))
         }
-        Err(e) => fail(&format!("failed to execute command: {}", e)),
     };
+    
+    let status;
+    let stdout;
+    if !capture {
+        status = match cmd.status() {
+            Ok(status) => status,
+            Err(e) => error(e),
+        };
+        stdout = None;
+    } else {
+        let output = match cmd.output() {
+            Ok(output) => output,
+            Err(e) => error(e),
+        };
+        status = output.status;
+        stdout = Some(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+
     if !status.success() {
         fail(&format!(
             "command did not execute successfully, got: {}",
             status
         ));
     }
+
+    return stdout;
 }
 
 fn find_exe(path: &Path) -> PathBuf {
