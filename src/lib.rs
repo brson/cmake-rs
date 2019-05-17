@@ -496,7 +496,10 @@ impl Config {
 
             let debug_info: bool = match &getenv_unwrap("DEBUG")[..] {
                 "false" => false,
+                "0" => false,
                 "true" => true,
+                "1" => true,
+                "2" => true,
                 unknown => {
                     eprintln!("Warning: unknown debug={}; defaulting to `true`.", unknown);
                     true
